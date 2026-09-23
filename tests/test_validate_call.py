@@ -4,7 +4,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from functools import partial
-from typing import Annotated, Any, Generic, Literal, TypeVar, Union
+from typing import Annotated, Any, Generic, Literal, TypeVar, Union, overload
 
 import pytest
 from pydantic_core import ArgsKwargs
@@ -1342,3 +1342,290 @@ def test_validate_call_defer_build() -> None:
 
     with pytest.raises(ValidationError):
         DeferBuildClass.cls_meth(x='not_an_int')
+
+
+def test_overloads_basic_dispatch() -> None:
+    body_calls = []
+
+    @overload
+    def rpc(a: int) -> int: ...
+    @overload
+    def rpc(a: str, b: str = 'default') -> str: ...
+
+    @validate_call(validate_overloads=True)
+    def rpc(a, b='default'):
+        body_calls.append((a, b))
+        return a
+
+    # only the int branch accepts 1 (int is not coerced to str in lax mode):
+    assert rpc(1) == 1
+    assert body_calls[-1] == (1, 'default')
+    # only the str branch accepts 'x' (not coercible to int), with the default applied:
+    assert rpc('x') == 'x'
+    assert body_calls[-1] == ('x', 'default')
+    # two positional arguments only bind to the str branch:
+    assert rpc('x', 'y') == 'x'
+    assert body_calls[-1] == ('x', 'y')
+    # probing candidate branches never executed the function body:
+    assert len(body_calls) == 3
+
+
+def test_overloads_binding_filter_precedes_type_validation() -> None:
+    seen_by_str_validator = []
+
+    def track(value):
+        seen_by_str_validator.append(value)
+        return value
+
+    @overload
+    def f(a: int) -> int: ...
+    @overload
+    def f(a: Annotated[str, BeforeValidator(track)], b: str) -> str: ...
+
+    @validate_call(validate_overloads=True)
+    def f(a, b=None):
+        return a
+
+    # 'x' cannot bind to (a, b), so the str branch is filtered out by binding
+    # rules and its validator never runs; the int branch rejects 'x' by type:
+    with pytest.raises(ValidationError) as exc_info:
+        f('x')
+    assert [e['type'] for e in exc_info.value.errors()] == ['overload_type', 'overload_binding']
+    assert seen_by_str_validator == []
+
+
+def test_overloads_ambiguity_requires_explicit_priority() -> None:
+    @overload
+    def f(a: int) -> int: ...
+    @overload
+    def f(a: str) -> str: ...
+
+    @validate_call(validate_overloads=True)
+    def f(a):
+        return a
+
+    assert f(1) == 1  # only the int branch matches
+    assert f('x') == 'x'  # only the str branch matches
+    # '5' is accepted by both branches; declaration order must not decide silently:
+    with pytest.raises(PydanticUserError, match='is ambiguous: overloads \\[0, 1\\] all accept'):
+        f('5')
+
+
+def test_overloads_priority() -> None:
+    body_calls = []
+
+    @overload
+    def f(a: int) -> int: ...
+    @overload
+    def f(a: str) -> str: ...
+
+    @validate_call(validate_overloads=True, overload_priority=[1, 0])
+    def f(a):
+        body_calls.append(a)
+        return a
+
+    # the str branch wins despite being declared second, so no int coercion happens:
+    assert f('5') == '5'
+    assert body_calls == ['5']
+    assert f(1) == 1
+
+
+def test_overloads_partial_priority() -> None:
+    @overload
+    def f(a: int) -> int: ...
+    @overload
+    def f(a: str) -> str: ...
+
+    # only overload 1 is prioritized; it still wins over the unprioritized overload 0:
+    @validate_call(validate_overloads=True, overload_priority=[1])
+    def f(a):
+        return a
+
+    assert f('5') == '5'
+
+
+def test_overloads_validator_and_body_call_counts() -> None:
+    int_validator_calls = []
+    list_validator_calls = []
+    body_calls = []
+
+    def track_int(value):
+        int_validator_calls.append(value)
+        return value
+
+    def track_list(value):
+        list_validator_calls.append(value)
+        return value
+
+    @overload
+    def f(a: Annotated[int, BeforeValidator(track_int)]) -> int: ...
+    @overload
+    def f(a: Annotated[list, BeforeValidator(track_list)]) -> list: ...
+
+    @validate_call(validate_overloads=True)
+    def f(a):
+        body_calls.append(a)
+        return a
+
+    assert f('3') == 3
+    # the int branch was probed exactly once and its converted value was reused for the call:
+    assert int_validator_calls == ['3']
+    # the list branch was probed exactly once (and then rejected '3' by type):
+    assert list_validator_calls == ['3']
+    # the function body ran exactly once, with the converted argument:
+    assert body_calls == [3]
+
+    assert f([1]) == [1]
+    assert int_validator_calls == ['3', [1]]
+    assert list_validator_calls == ['3', [1]]
+    assert body_calls == [3, [1]]
+
+
+def test_overloads_return_uses_selected_branch_annotation() -> None:
+    @overload
+    def f(a: int) -> int: ...
+    @overload
+    def f(a: str) -> str: ...
+
+    @validate_call(validate_overloads=True)
+    def f(a):
+        return a
+
+    assert f(1) == 1
+    assert f('x') == 'x'
+
+    @overload
+    def g(a: int) -> int: ...
+    @overload
+    def g(a: str) -> str: ...
+
+    @validate_call(validate_overloads=True)
+    def g(a):
+        return 'not an int'
+
+    # the int branch is selected, so the return value must satisfy its annotation:
+    with pytest.raises(ValidationError):
+        g(1)
+    # the str branch is selected, so the same return value is fine:
+    assert g('x') == 'not an int'
+
+
+def test_overloads_positional_only_and_keyword_only() -> None:
+    @overload
+    def f(a: int, /) -> int: ...
+    @overload
+    def f(*, a: str) -> str: ...
+
+    @validate_call(validate_overloads=True)
+    def f(*args, **kwargs):
+        return args[0] if args else kwargs['a']
+
+    assert f(1) == 1  # positional call binds to the positional-only branch
+    assert f(a='x') == 'x'  # keyword call binds to the keyword-only branch
+    # 'x' positionally binds to branch 0 but fails int validation, and cannot
+    # bind to the keyword-only branch:
+    with pytest.raises(ValidationError) as exc_info:
+        f('x')
+    assert [e['type'] for e in exc_info.value.errors()] == ['overload_type', 'overload_binding']
+
+
+def test_overloads_partial() -> None:
+    body_calls = []
+
+    @overload
+    def f(a: int, b: int) -> int: ...
+    @overload
+    def f(a: str, b: str) -> str: ...
+
+    def f(a, b):
+        body_calls.append((a, b))
+        return b
+
+    w = validate_call(partial(f, 1), validate_overloads=True)
+
+    # a is pre-filled with 1; only the int branch accepts b=2:
+    assert w(2) == 2
+    assert body_calls[-1] == (1, 2)
+    # 'x' is not coercible to int, so the str branch is selected:
+    assert w('x') == 'x'
+    assert body_calls[-1] == (1, 'x')
+    assert len(body_calls) == 2
+
+
+def test_overloads_no_match_lists_each_signature_error() -> None:
+    @overload
+    def f(a: int) -> int: ...
+    @overload
+    def f(a: str, b: str) -> str: ...
+
+    @validate_call(validate_overloads=True)
+    def f(a, b=None):
+        return a
+
+    # too many arguments: both signatures fail at the binding stage:
+    with pytest.raises(ValidationError) as exc_info:
+        f(1, 2, 3)
+    errors = exc_info.value.errors()
+    assert [e['type'] for e in errors] == ['overload_binding', 'overload_binding']
+    assert [e['loc'] for e in errors] == [(0,), (1,)]
+    assert 'Overload 0' in str(exc_info.value)
+    assert 'Overload 1' in str(exc_info.value)
+
+    # one binding failure and one type failure:
+    with pytest.raises(ValidationError) as exc_info:
+        f('x')
+    errors = exc_info.value.errors()
+    assert [e['type'] for e in errors] == ['overload_type', 'overload_binding']
+    assert [e['loc'] for e in errors] == [(0,), (1,)]
+
+
+def test_overloads_async() -> None:
+    body_calls = []
+
+    @overload
+    async def f(a: int) -> int: ...
+    @overload
+    async def f(a: str) -> str: ...
+
+    @validate_call(validate_overloads=True)
+    async def f(a):
+        body_calls.append(a)
+        return a
+
+    assert asyncio.run(f(1)) == 1
+    assert asyncio.run(f('x')) == 'x'
+    assert body_calls == [1, 'x']
+
+
+def test_overloads_async_return_validated_after_await() -> None:
+    @overload
+    async def f(a: int) -> int: ...
+
+    @validate_call(validate_overloads=True)
+    async def f(a):
+        return 'not an int'
+
+    # the coroutine itself must be awaited before the return value is validated:
+    with pytest.raises(ValidationError):
+        asyncio.run(f(1))
+
+
+def test_overloads_not_defined() -> None:
+    with pytest.raises(PydanticUserError, match='no `@overload` signatures were found'):
+
+        @validate_call(validate_overloads=True)
+        def f(a: int) -> int:
+            return a
+
+
+def test_overloads_invalid_priority() -> None:
+    @overload
+    def f(a: int) -> int: ...
+    @overload
+    def f(a: str) -> str: ...
+
+    def f(a):
+        return a
+
+    with pytest.raises(PydanticUserError, match='invalid overload indices'):
+        validate_call(validate_overloads=True, overload_priority=[0, 7])(f)

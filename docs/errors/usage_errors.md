@@ -1276,6 +1276,78 @@ except PydanticUserError as exc_info:
     assert exc_info.code == 'validate-call-type'
 ```
 
+## No overloads found for `validate_call` {#validate-call-no-overloads}
+
+This error is raised when `validate_overloads=True` is passed to [`validate_call`][pydantic.validate_call]
+but the decorated function has no [`@overload`][typing.overload] signatures registered for it.
+
+```python
+from pydantic import PydanticUserError, validate_call
+
+try:
+
+    @validate_call(validate_overloads=True)
+    def f(a: int) -> int:
+        return a
+
+except PydanticUserError as exc_info:
+    assert exc_info.code == 'validate-call-no-overloads'
+```
+
+## Invalid overload priority for `validate_call` {#validate-call-invalid-overload-priority}
+
+This error is raised when `overload_priority` passed to [`validate_call`][pydantic.validate_call]
+contains indices that do not correspond to any of the function's [`@overload`][typing.overload] signatures.
+
+```python
+from typing import overload
+
+from pydantic import PydanticUserError, validate_call
+
+try:
+
+    @overload
+    def f(a: int) -> int: ...
+    @overload
+    def f(a: str) -> str: ...
+
+    @validate_call(validate_overloads=True, overload_priority=[0, 5])
+    def f(a):
+        return a
+
+except PydanticUserError as exc_info:
+    assert exc_info.code == 'validate-call-invalid-overload-priority'
+```
+
+## Ambiguous call for `validate_call` overloads {#validate-call-overload-ambiguity}
+
+This error is raised when [`validate_call`][pydantic.validate_call] is used with `validate_overloads=True`
+and more than one [`@overload`][typing.overload] signature accepts the provided arguments. Declaration order
+is never used to break the tie silently; pass `overload_priority` to define an explicit priority instead.
+
+```python
+from typing import overload
+
+from pydantic import PydanticUserError, validate_call
+
+
+@overload
+def g(a: int) -> int: ...
+@overload
+def g(a: str) -> str: ...
+
+
+@validate_call(validate_overloads=True)
+def g(a):
+    return a
+
+
+try:
+    g('5')  # accepted by both the int and the str overload
+except PydanticUserError as exc_info:
+    assert exc_info.code == 'validate-call-overload-ambiguity'
+```
+
 ## [`Unpack`][typing.Unpack] used without a [`TypedDict`][typing.TypedDict] {#unpack-typed-dict}
 
 This error is raised when [`Unpack`][typing.Unpack] is used with something other than

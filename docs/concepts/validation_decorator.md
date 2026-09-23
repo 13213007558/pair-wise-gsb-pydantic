@@ -320,6 +320,67 @@ asyncio.run(main())
 # requires: `conn.execute()` that will return `'testing@example.com'`
 ```
 
+## Overloaded functions
+
+When a function has [`@overload`][typing.overload] signatures, [`validate_call()`][pydantic.validate_call]
+normally only sees the (usually broader) implementation signature. Passing `validate_overloads=True` enables
+overload-aware dispatch instead: each call is first filtered using Python's argument binding rules, then validated
+against each remaining overload, and the matching overload's converted arguments are used for the actual call.
+The return value is validated against the selected overload's return annotation (after `await`ing it for
+coroutines). Candidate probing never executes the function body, each overload's validators run at most once per
+call, and the function body always runs at most once:
+
+```python
+from typing import overload
+
+from pydantic import validate_call
+
+
+@overload
+def rpc(method: int, payload: int) -> int: ...
+@overload
+def rpc(method: str, payload: str) -> str: ...
+
+
+@validate_call(validate_overloads=True)
+def rpc(method, payload):
+    return payload
+
+
+print(rpc(1, 2))
+#> 2
+print(rpc('a', 'b'))
+#> b
+```
+
+If several overloads accept the same call, the call is reported as ambiguous — declaration order is never used
+to break the tie silently. Pass `overload_priority` (overload indices, in declaration order) to define an
+explicit priority:
+
+```python
+from typing import overload
+
+from pydantic import validate_call
+
+
+@overload
+def parse(value: int) -> int: ...
+@overload
+def parse(value: str) -> str: ...
+
+
+@validate_call(validate_overloads=True, overload_priority=[1, 0])
+def parse(value):
+    return value
+
+
+print(parse('5'))  # both overloads accept '5', the str one wins
+#> 5
+```
+
+If no overload matches, a [`ValidationError`][pydantic.ValidationError] is raised listing the binding or
+type error of every overload.
+
 ## Compatibility with type checkers
 
 As the [`validate_call()`][pydantic.validate_call] decorator preserves the decorated function's signature,

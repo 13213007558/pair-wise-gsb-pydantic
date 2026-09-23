@@ -3,6 +3,7 @@
 from __future__ import annotations as _annotations
 
 import inspect
+from collections.abc import Sequence
 from functools import partial
 from types import BuiltinFunctionType
 from typing import TYPE_CHECKING, Any, Callable, TypeVar, cast, overload
@@ -71,7 +72,11 @@ def _check_function_type(function: object) -> None:
 
 @overload
 def validate_call(
-    *, config: ConfigDict | None = None, validate_return: bool = False
+    *,
+    config: ConfigDict | None = None,
+    validate_return: bool = False,
+    validate_overloads: bool = False,
+    overload_priority: Sequence[int] | None = None,
 ) -> Callable[[AnyCallableT], AnyCallableT]: ...
 
 
@@ -85,6 +90,8 @@ def validate_call(
     *,
     config: ConfigDict | None = None,
     validate_return: bool = False,
+    validate_overloads: bool = False,
+    overload_priority: Sequence[int] | None = None,
 ) -> AnyCallableT | Callable[[AnyCallableT], AnyCallableT]:
     """!!! abstract "Usage Documentation"
         [Validation Decorator](../concepts/validation_decorator.md)
@@ -97,6 +104,14 @@ def validate_call(
         func: The function to be decorated.
         config: The configuration dictionary.
         validate_return: Whether to validate the return value.
+        validate_overloads: Whether to dispatch calls through the function's `@overload` signatures.
+            When enabled, each call is first filtered by Python's argument binding rules, then validated
+            against each remaining overload; the call is dispatched using the matching overload's converted
+            arguments and its return value is validated against that overload's return annotation.
+        overload_priority: Optional explicit priority used when more than one overload accepts a call.
+            A sequence of overload indices (in `typing.get_overloads()` order); among the matching
+            overloads, the one appearing first wins. Without it, ambiguous calls raise an error instead of
+            silently relying on declaration order.
 
     Returns:
         The decorated function.
@@ -106,7 +121,12 @@ def validate_call(
     def validate(function: AnyCallableT) -> AnyCallableT:
         _check_function_type(function)
         validate_call_wrapper = _validate_call.ValidateCallWrapper(
-            cast(_generate_schema.ValidateCallSupportedTypes, function), config, validate_return, parent_namespace
+            cast(_generate_schema.ValidateCallSupportedTypes, function),
+            config,
+            validate_return,
+            parent_namespace,
+            validate_overloads,
+            overload_priority,
         )
         return _validate_call.update_wrapper_attributes(function, validate_call_wrapper.__call__)  # type: ignore
 
