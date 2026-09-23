@@ -10,7 +10,7 @@ import operator
 import sys
 import types
 import warnings
-from collections.abc import Generator, Mapping
+from collections.abc import Generator, Iterable, Mapping
 from copy import copy, deepcopy
 from functools import cached_property
 from typing import (
@@ -66,7 +66,7 @@ if TYPE_CHECKING:
     from .fields import ComputedFieldInfo, FieldInfo, ModelPrivateAttr
 
 
-__all__ = 'BaseModel', 'create_model'
+__all__ = 'BaseModel', 'create_model', 'rebuild_models'
 
 # Keep these type aliases available at runtime:
 TupleGenerator: TypeAlias = Generator[tuple[str, Any], None, None]
@@ -1814,6 +1814,120 @@ def create_model(  # noqa: C901
         _create_model_module=__module__,
         **kwds,
     )
+
+
+def _restore_model_states(snapshots: dict[type[BaseModel], dict[str, Any]]) -> None:
+    """Restore the class `__dict__` entries of the given models to a previously snapshotted state."""
+    missing = object()
+    for model, snapshot in snapshots.items():
+        current = model.__dict__
+        for key in list(current):
+            if key not in snapshot:
+                delattr(model, key)
+        for key, value in snapshot.items():
+            if current.get(key, missing) is not value:
+                setattr(model, key, value)
+
+
+def rebuild_models(
+    models: Iterable[type[BaseModel]],
+    *,
+    types_namespace: MappingNamespace | None = None,
+    raise_errors: bool = True,
+) -> bool:
+    """Rebuild a group of models in a single, atomic operation, using a shared types namespace.
+
+    This is useful when a set of models reference each other (directly, or through generic
+    parameters) using forward references that can only be resolved once every model — and
+    every externally contributed type — is available (e.g. with models referencing types
+    contributed by plugins that are registered after the model classes were created).
+
+    Unlike calling [`model_rebuild()`][pydantic.BaseModel.model_rebuild] on each model
+    individually, the rebuild is atomic: the core schemas, validators and serializers of
+    every model in the group are only published if *all* the models could be rebuilt. If
+    any model fails to rebuild (e.g. because a referenced name is still undefined), every
+    model in the group keeps the definitions it had before the call.
+
+    The rebuild is scoped to the provided group: references between group members are
+    resolved against the group itself (the existing core schemas of the members are
+    discarded and regenerated), while models outside of the group are left untouched.
+
+    Args:
+        models: The models to rebuild. Every model is rebuilt with a shared types
+            namespace, so that references between members of the group resolve to the
+            group members themselves.
+        types_namespace: An optional extra types namespace, shared by every model in the
+            group. The group members take precedence over the names defined in this
+            namespace.
+        raise_errors: Whether to raise errors, defaults to `True`. If `False` and a
+            referenced name is undefined, `False` is returned instead of raising a
+            `PydanticUndefinedAnnotation` error.
+
+    Returns:
+        `True` if the group was successfully rebuilt, `False` otherwise (only possible
+        when `raise_errors=False`).
+
+    Raises:
+        TypeError: If one of the provided models is not a `BaseModel` subclass.
+        PydanticUndefinedAnnotation: If an annotation references an undefined name and
+            `raise_errors=True`.
+    """
+    group: list[type[BaseModel]] = []
+    for model in models:
+        if not (isinstance(model, type) and issubclass(model, BaseModel)):
+            raise TypeError(f'Expected a Pydantic model, got {model!r}')
+        if model not in group:
+            group.append(model)
+
+    if not group:
+        return True
+
+    # The types namespace shared by every model in the group. Group members take
+    # precedence, so that references between members resolve to the members themselves:
+    shared_ns: dict[str, Any] = dict(types_namespace) if types_namespace is not None else {}
+    for model in group:
+        shared_ns[model.__name__] = model
+
+    # Snapshot the state of every member, so that the pre-call definitions can be
+    # restored if any member fails to rebuild:
+    snapshots = {model: dict(model.__dict__) for model in group}
+    already_complete = {model: model.__pydantic_complete__ for model in group}
+
+    # Mark every member as incomplete and discard the existing core schemas, validators
+    # and serializers *before* rebuilding anything (mirroring `model_rebuild(force=True)`),
+    # so that references between group members are resolved against the group itself
+    # instead of reusing previously built (and potentially stale) core schemas:
+    for model in group:
+        model.__pydantic_complete__ = False
+        for attr in ('__pydantic_core_schema__', '__pydantic_validator__', '__pydantic_serializer__'):
+            if attr in model.__dict__ and not isinstance(getattr(model, attr), _mock_val_ser.MockValSer):
+                delattr(model, attr)
+
+    try:
+        for model in group:
+            parent_ns = _model_construction.unpack_lenient_weakvaluedict(model.__pydantic_parent_namespace__) or {}
+            ns_resolver = _namespace_utils.NsResolver(
+                # The shared namespace takes precedence over the model's own parent
+                # namespace, so that names introduced by the group (and the explicitly
+                # provided namespace) are the ones being resolved to:
+                parent_namespace={**parent_ns, **shared_ns},
+            )
+            completed = _model_construction.complete_model_class(
+                model,
+                _config.ConfigWrapper(model.model_config, check=False),
+                ns_resolver,
+                raise_errors=raise_errors,
+                call_on_complete_hook=not already_complete[model],
+            )
+            if not completed:
+                # Can only happen when `raise_errors=False`:
+                _restore_model_states(snapshots)
+                return False
+    except Exception:
+        _restore_model_states(snapshots)
+        raise
+
+    return True
 
 
 __getattr__ = getattr_migration(__name__)

@@ -122,6 +122,7 @@ __all__ = (
     # main
     'BaseModel',
     'create_model',
+    'rebuild_models',
     # network
     'AnyUrl',
     'AnyHttpUrl',
@@ -291,6 +292,7 @@ _dynamic_imports: 'dict[str, tuple[str, str]]' = {
     # main
     'BaseModel': (__spec__.parent, '.main'),
     'create_model': (__spec__.parent, '.main'),
+    'rebuild_models': (__spec__.parent, '.main'),
     # network
     'AnyUrl': (__spec__.parent, '.networks'),
     'AnyHttpUrl': (__spec__.parent, '.networks'),
