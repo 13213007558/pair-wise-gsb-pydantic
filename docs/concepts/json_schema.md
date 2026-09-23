@@ -1152,6 +1152,75 @@ print(json.dumps(top_level_schema, indent=2))
 """
 ```
 
+### Bundling schemas as standalone documents
+
+When schemas need to be published as individual documents (e.g. to a public schema directory), you can
+use [`json_schema_bundle`][pydantic.json_schema.json_schema_bundle]. Instead of collecting every
+definition in a single $defs object, it returns one document per definition, with all references —
+including the ones in discriminator mappings — rewritten to public URIs allocated by a callable you
+provide. Definitions with identical content share a single document, while same-named models with
+different structures are kept as separate documents. Each entry is associated with a stable key, and
+the returned entry schemas are ordered by that key:
+
+```python {output="json"}
+import json
+
+from pydantic import BaseModel
+from pydantic.json_schema import json_schema_bundle
+
+
+class Foo(BaseModel):
+    a: str
+
+
+class Model(BaseModel):
+    b: Foo
+
+
+entries, definitions = json_schema_bundle(
+    [('model', Model, 'validation')],
+    definition_uri=lambda name: f'https://schemas.example.com/{name}.json',
+)
+print(json.dumps(entries, indent=2))
+"""
+{
+  "model": {
+    "$ref": "https://schemas.example.com/Model.json"
+  }
+}
+"""
+print(json.dumps(definitions, indent=2))
+"""
+{
+  "https://schemas.example.com/Foo.json": {
+    "properties": {
+      "a": {
+        "title": "A",
+        "type": "string"
+      }
+    },
+    "required": [
+      "a"
+    ],
+    "title": "Foo",
+    "type": "object"
+  },
+  "https://schemas.example.com/Model.json": {
+    "properties": {
+      "b": {
+        "$ref": "https://schemas.example.com/Foo.json"
+      }
+    },
+    "required": [
+      "b"
+    ],
+    "title": "Model",
+    "type": "object"
+  }
+}
+"""
+```
+
 ## Customizing the JSON Schema Generation Process
 
 ??? api "API Documentation"

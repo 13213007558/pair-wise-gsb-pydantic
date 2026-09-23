@@ -68,6 +68,7 @@ from pydantic.json_schema import (
     NoDefault,
     PydanticJsonSchemaWarning,
     SkipJsonSchema,
+    json_schema_bundle,
     model_json_schema,
     models_json_schema,
 )
@@ -1721,6 +1722,242 @@ def test_schema_no_definitions():
     keys_map, model_schema = models_json_schema([], title='Schema without definitions')
     assert keys_map == {}
     assert model_schema == {'title': 'Schema without definitions'}
+
+
+def _collect_bundle_refs(item: Any) -> set:
+    """Collect all JSON references from a JSON schema, including discriminator mapping values."""
+    refs = set()
+    stack = [item]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            for key, value in current.items():
+                if key == '$ref' and isinstance(value, str):
+                    refs.add(value)
+                elif key == 'mapping' and isinstance(value, dict):
+                    refs.update(v for v in value.values() if isinstance(v, str))
+                else:
+                    stack.append(value)
+        elif isinstance(current, list):
+            stack.extend(current)
+    return refs
+
+
+def _assert_bundle_closure(entries: dict, definitions: dict) -> None:
+    """Re-resolve every reference to its target document and check the bundle is complete."""
+    # every reference in every produced document resolves to a produced definition document:
+    for document in [*entries.values(), *definitions.values()]:
+        for ref in _collect_bundle_refs(document):
+            assert ref in definitions, f'unresolved reference: {ref}'
+
+    # every produced document is reachable from the entry schemas:
+    reachable = set()
+    stack = list(entries.values())
+    while stack:
+        for ref in _collect_bundle_refs(stack.pop()):
+            if ref not in reachable:
+                reachable.add(ref)
+                stack.append(definitions[ref])
+    assert reachable == set(definitions)
+
+
+def test_json_schema_bundle_same_name_models_split():
+    def build_foo_a() -> type[BaseModel]:
+        class Foo(BaseModel):
+            a: int
+
+        return Foo
+
+    def build_foo_b() -> type[BaseModel]:
+        class Foo(BaseModel):
+            b: str
+
+        return Foo
+
+    FooA, FooB = build_foo_a(), build_foo_b()
+
+    class UsesBoth(BaseModel):
+        first: FooA
+        second: FooB
+
+    entries, definitions = json_schema_bundle(
+        [('uses-both', UsesBoth, 'validation')],
+        definition_uri=lambda name: f'https://schemas.example.com/{name}.json',
+    )
+
+    uses_both_doc = definitions[entries['uses-both']['$ref']]
+    foo_uris = {
+        uses_both_doc['properties']['first']['$ref'],
+        uses_both_doc['properties']['second']['$ref'],
+    }
+    # same-named models with different structures are split into two documents:
+    assert len(foo_uris) == 2
+    foo_docs = [definitions[uri] for uri in foo_uris]
+    assert {tuple(doc['properties']) for doc in foo_docs} == {('a',), ('b',)}
+    _assert_bundle_closure(entries, definitions)
+
+
+def test_json_schema_bundle_identical_definitions_shared():
+    def build_foo_1() -> type[BaseModel]:
+        class Foo(BaseModel):
+            a: int
+
+        return Foo
+
+    def build_foo_2() -> type[BaseModel]:
+        class Foo(BaseModel):
+            a: int
+
+        return Foo
+
+    def build_other_foo() -> type[BaseModel]:
+        class Foo(BaseModel):
+            b: str
+
+        return Foo
+
+    FooIdentical1, FooIdentical2, FooDifferent = build_foo_1(), build_foo_2(), build_other_foo()
+
+    class Root(BaseModel):
+        one: FooIdentical1
+        two: FooIdentical2
+        other: FooDifferent
+
+    entries, definitions = json_schema_bundle(
+        [('root', Root, 'validation')],
+        definition_uri=lambda name: f'https://schemas.example.com/{name}.json',
+    )
+
+    root_doc = definitions[entries['root']['$ref']]
+    properties = root_doc['properties']
+    # identical definitions share a single document:
+    assert properties['one']['$ref'] == properties['two']['$ref']
+    # but the structurally different model gets its own document:
+    assert properties['other']['$ref'] != properties['one']['$ref']
+    assert len(definitions) == 3  # Root, the shared Foo document and the different Foo document
+    _assert_bundle_closure(entries, definitions)
+
+
+def test_json_schema_bundle_recursive_generics():
+    class A(BaseModel, Generic[T]):
+        child: 'B[T] | None' = None
+        value: T
+
+    class B(BaseModel, Generic[T]):
+        child: 'A[T] | None' = None
+        value: T
+
+    A.model_rebuild()
+    B.model_rebuild()
+
+    entries, definitions = json_schema_bundle(
+        [('z-entry', B[str], 'validation'), ('a-entry', A[int], 'validation')],
+        definition_uri=lambda name: f'https://schemas.example.com/{name}.json',
+    )
+
+    # entries are ordered by their stable key, not by the order they were passed in:
+    assert list(entries) == ['a-entry', 'z-entry']
+
+    a_doc = definitions[entries['a-entry']['$ref']]
+    assert a_doc['title'] == 'A[int]'
+    # B[int] is only reachable through the recursive reference from A[int]:
+    b_int_doc = definitions[a_doc['properties']['child']['anyOf'][0]['$ref']]
+    assert b_int_doc['title'] == 'B[int]'
+    # and it recursively points back to the A[int] document:
+    assert b_int_doc['properties']['child']['anyOf'][0]['$ref'] == entries['a-entry']['$ref']
+
+    assert len(definitions) == 4  # A[int], B[int], A[str] and B[str]
+    _assert_bundle_closure(entries, definitions)
+
+
+def test_json_schema_bundle_dual_mode():
+    class Plain(BaseModel):
+        x: int
+
+    class WithComputed(BaseModel):
+        x: int
+
+        @computed_field
+        @property
+        def double(self) -> int:
+            return self.x * 2
+
+    entries, definitions = json_schema_bundle(
+        [
+            ('computed-output', WithComputed, 'serialization'),
+            ('plain-output', Plain, 'serialization'),
+            ('plain-input', Plain, 'validation'),
+            ('computed-input', WithComputed, 'validation'),
+        ],
+        definition_uri=lambda name: f'https://schemas.example.com/{name}.json',
+    )
+
+    # entries are ordered by their stable key, not by the order they were passed in:
+    assert list(entries) == ['computed-input', 'computed-output', 'plain-input', 'plain-output']
+
+    # the validation and serialization schemas of Plain are identical and share a document:
+    assert entries['plain-input'] == entries['plain-output']
+
+    # WithComputed differs between modes, so each mode gets its own document:
+    assert entries['computed-input'] != entries['computed-output']
+    input_doc = definitions[entries['computed-input']['$ref']]
+    output_doc = definitions[entries['computed-output']['$ref']]
+    assert set(input_doc['properties']) == {'x'}
+    assert set(output_doc['properties']) == {'x', 'double'}
+
+    _assert_bundle_closure(entries, definitions)
+
+
+def test_json_schema_bundle_discriminator_mapping():
+    class Cat(BaseModel):
+        pet_type: Literal['cat'] = 'cat'
+        meows: int
+
+    class Dog(BaseModel):
+        pet_type: Literal['dog'] = 'dog'
+        barks: float
+
+    class PetOwner(BaseModel):
+        pet: Union[Cat, Dog] = Field(discriminator='pet_type')
+
+    entries, definitions = json_schema_bundle(
+        [('pet-owner', PetOwner, 'validation')],
+        definition_uri=lambda name: f'https://schemas.example.com/{name}.json',
+    )
+
+    owner_doc = definitions[entries['pet-owner']['$ref']]
+    mapping = owner_doc['properties']['pet']['discriminator']['mapping']
+    assert set(mapping) == {'cat', 'dog'}
+    # the mapping values point to the produced documents, not to local '$defs' references:
+    assert set(mapping.values()) <= set(definitions)
+    assert {definitions[uri]['title'] for uri in mapping.values()} == {'Cat', 'Dog'}
+    _assert_bundle_closure(entries, definitions)
+
+
+def test_json_schema_bundle_errors():
+    class Model(BaseModel):
+        x: int
+
+    class Other(BaseModel):
+        y: str
+
+    with pytest.raises(ValueError, match='Duplicate entry key'):
+        json_schema_bundle(
+            [('m', Model, 'validation'), ('m', Model, 'validation')],
+            definition_uri=lambda name: f'https://schemas.example.com/{name}.json',
+        )
+
+    with pytest.raises(ValueError, match='same URI'):
+        json_schema_bundle(
+            [('m', Model, 'validation'), ('o', Other, 'validation')],
+            definition_uri=lambda name: 'https://schemas.example.com/same.json',
+        )
+
+    with pytest.raises(ValueError, match='non-empty string'):
+        json_schema_bundle(
+            [('m', Model, 'validation')],
+            definition_uri=lambda name: '',
+        )
 
 
 def test_list_default():

@@ -2605,6 +2605,145 @@ def models_json_schema(
     return json_schemas_map, json_schema
 
 
+def json_schema_bundle(
+    entries: Sequence[tuple[JsonSchemaKeyT, type[BaseModel] | type[PydanticDataclass], JsonSchemaMode]],
+    *,
+    definition_uri: Callable[[str], str],
+    by_alias: bool = True,
+    ref_template: str = DEFAULT_REF_TEMPLATE,
+    union_format: Literal['any_of', 'primitive_type_array'] = 'any_of',
+    schema_generator: type[GenerateJsonSchema] = GenerateJsonSchema,
+) -> tuple[dict[JsonSchemaKeyT, JsonSchemaValue], dict[str, JsonSchemaValue]]:
+    """Utility function to generate a bundle of standalone JSON Schema documents for multiple models.
+
+    Unlike 'models_json_schema', which collects every definition in a single '$defs' object, this
+    function produces one document per definition, ready to be published individually (e.g. to a
+    public schema directory). All references, including the ones in 'discriminator.mapping', are
+    rewritten to the public URIs allocated by 'definition_uri'.
+
+    Args:
+        entries: A sequence of tuples of the form (key, model, mode), where key is a stable
+            identifier for the entry. The returned entry schemas are ordered by this key (converted
+            to a string), independently of the order in which the model classes were created.
+            Keys must be unique.
+        definition_uri: A callable mapping each definition name to the public URI at which the
+            corresponding document will be published. It is called exactly once per unique
+            definition; definitions with identical content share a single document (and thus a
+            single URI), while same-named models with different structures are kept as separate
+            definitions. It must not return the same URI for two different definitions.
+        by_alias: Whether field aliases should be used as keys in the generated JSON Schema.
+        ref_template: The reference template to use for generating JSON Schema references.
+        union_format: The format to use when combining schemas from unions together. Can be one of:
+
+            - 'any_of': Use the anyOf keyword to combine schemas (the default).
+            - 'primitive_type_array': Use the type keyword as an array of strings, containing each
+              type of the combination. If any of the schemas is not a primitive type ('string',
+              'boolean', 'null', 'integer' or 'number') or contains constraints/metadata, falls
+              back to 'any_of'.
+        schema_generator: The schema generator to use for generating the JSON Schema.
+
+    Returns:
+        A tuple where:
+            - The first element is a dictionary whose keys are the entry keys (ordered by their
+                string representation) and whose values are the JSON schema for that entry, with
+                all references pointing to the URIs of the documents in the second returned element.
+            - The second element is a dictionary whose keys are the URIs produced by
+                'definition_uri' (sorted) and whose values are the standalone JSON Schema documents
+                for each definition. Every reference in the returned schemas resolves to one of
+                these documents, including definitions that are only reachable through recursive
+                references.
+
+    Raises:
+        ValueError: If two entries share the same key, or if 'definition_uri' returns the same URI
+            for two different definitions.
+    """
+    seen_keys: set[Any] = set()
+    for key, cls, _mode in entries:
+        if key in seen_keys:
+            raise ValueError(f'Duplicate entry key: {key!r}')
+        seen_keys.add(key)
+        if isinstance(cls.__pydantic_core_schema__, _mock_val_ser.MockCoreSchema):
+            cls.__pydantic_core_schema__.rebuild()
+
+    instance = schema_generator(by_alias=by_alias, ref_template=ref_template, union_format=union_format)
+    inputs: list[tuple[int, JsonSchemaMode, CoreSchema]] = [
+        (index, mode, cls.__pydantic_core_schema__) for index, (_, cls, mode) in enumerate(entries)
+    ]
+    json_schemas_map, definitions = instance.generate_definitions(inputs)
+
+    # The JSON reference that the ref template produces for each definition:
+    defs_to_json_ref: dict[DefsRef, JsonRef] = {
+        defs_ref: JsonRef(ref_template.format(model=defs_ref)) for defs_ref in definitions
+    }
+    json_ref_to_defs: dict[JsonRef, DefsRef] = {json_ref: defs_ref for defs_ref, json_ref in defs_to_json_ref.items()}
+
+    # Merge definitions with identical content so that they share a single document. Merging two
+    # definitions may make other definitions identical (once their references are rewritten to the
+    # shared document), so iterate until a fixed point is reached:
+    json_ref_redirects: dict[JsonRef, JsonRef] = {json_ref: json_ref for json_ref in json_ref_to_defs}
+    while True:
+        defs_refs_by_content: dict[_HashableJsonValue, list[DefsRef]] = defaultdict(list)
+        for defs_ref, schema in definitions.items():
+            defs_refs_by_content[_make_json_hashable(schema)].append(defs_ref)
+        redirects = {
+            defs_to_json_ref[duplicate]: defs_to_json_ref[canonical]
+            for defs_refs in defs_refs_by_content.values()
+            for canonical, *duplicates in [sorted(defs_refs)]
+            for duplicate in duplicates
+        }
+        if not redirects:
+            break
+        json_ref_redirects = {
+            original: redirects.get(current, current) for original, current in json_ref_redirects.items()
+        }
+        definitions = {
+            defs_ref: _replace_json_refs(schema, redirects)
+            for defs_ref, schema in definitions.items()
+            if defs_to_json_ref[defs_ref] not in redirects
+        }
+
+    uri_by_defs_ref: dict[DefsRef, str] = {}
+    for defs_ref in sorted(definitions):
+        uri = definition_uri(defs_ref)
+        if not isinstance(uri, str) or not uri:
+            raise ValueError(f'definition_uri() must return a non-empty string, got {uri!r}')
+        if uri in uri_by_defs_ref.values():
+            raise ValueError(f'definition_uri() returned the same URI for two different definitions: {uri!r}')
+        uri_by_defs_ref[defs_ref] = uri
+
+    # Rewrite every reference (including discriminator mapping values) to the allocated URIs:
+    json_ref_to_uri = {
+        original: uri_by_defs_ref[json_ref_to_defs[current]] for original, current in json_ref_redirects.items()
+    }
+
+    bundled_entries: dict[JsonSchemaKeyT, JsonSchemaValue] = {}
+    for index, (key, _cls, mode) in enumerate(entries):
+        bundled_entries[key] = _replace_json_refs(json_schemas_map[(index, mode)], json_ref_to_uri)
+    bundled_entries = dict(sorted(bundled_entries.items(), key=lambda item: str(item[0])))
+
+    bundled_definitions = {
+        uri_by_defs_ref[defs_ref]: _replace_json_refs(schema, json_ref_to_uri)
+        for defs_ref, schema in sorted(definitions.items(), key=lambda item: uri_by_defs_ref[item[0]])
+    }
+    return bundled_entries, bundled_definitions
+
+
+def _replace_json_refs(value: Any, replacements: dict[str, str]) -> Any:
+    """Recursively replace JSON references in a JSON schema.
+
+    Any string exactly matching a known reference is replaced, which covers both '$ref' values and
+    'discriminator.mapping' values. As with _DefinitionsRemapping.remap_json_schema, we rely on
+    references not colliding with unrelated strings in the schema.
+    """
+    if isinstance(value, str):
+        return replacements.get(value, value)
+    elif isinstance(value, list):
+        return [_replace_json_refs(item, replacements) for item in value]
+    elif isinstance(value, dict):
+        return {key: _replace_json_refs(item, replacements) for key, item in value.items()}
+    return value
+
+
 # ##### End JSON Schema Generation Functions #####
 
 
