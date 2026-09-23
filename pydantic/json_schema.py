@@ -13,6 +13,7 @@ from __future__ import annotations as _annotations
 
 import dataclasses
 import inspect
+import json
 import math
 import os
 import re
@@ -2603,6 +2604,173 @@ def models_json_schema(
         json_schema['description'] = description
 
     return json_schemas_map, json_schema
+
+
+@dataclasses.dataclass(frozen=True)
+class JsonSchemaBundle:
+    """The result of [`models_json_schema_bundle`][pydantic.json_schema.models_json_schema_bundle].
+
+    Attributes:
+        entries: A mapping of stable entry identifiers (of the form `'<module>.<qualname>:<mode>'`) to the
+            JSON schema generated for that entry. Every reference (including the ones in
+            `discriminator.mapping` values) points to the public URI of a document in
+            [`definitions`][pydantic.json_schema.JsonSchemaBundle.definitions]. Iteration order is sorted
+            by entry identifier, and does not depend on the order in which the models were created or
+            passed in.
+        definitions: A mapping of public URIs (as produced by the caller-provided URI allocator) to
+            standalone JSON schema documents. Each document carries its own URI under the `$id` key, and
+            definitions with identical schemas share a single document. Iteration order is sorted by URI.
+    """
+
+    entries: dict[str, JsonSchemaValue]
+    definitions: dict[str, JsonSchemaValue]
+
+
+def _remap_schema_refs(schema: Any, ref_mapping: dict[str, str]) -> Any:
+    """Return a copy of `schema` with every reference replaced according to `ref_mapping`.
+
+    References are found in `$ref` values and in `discriminator.mapping` values; any of them that is a
+    key of `ref_mapping` is replaced by the corresponding value.
+    """
+    if isinstance(schema, dict):
+        remapped: dict[str, Any] = {}
+        for key, value in schema.items():
+            if key == '$ref' and isinstance(value, str):
+                remapped[key] = ref_mapping.get(value, value)
+            elif key == 'mapping' and isinstance(value, dict):
+                remapped[key] = {
+                    k: ref_mapping.get(v, v) if isinstance(v, str) else _remap_schema_refs(v, ref_mapping)
+                    for k, v in value.items()
+                }
+            else:
+                remapped[key] = _remap_schema_refs(value, ref_mapping)
+        return remapped
+    elif isinstance(schema, list):
+        return [_remap_schema_refs(item, ref_mapping) for item in schema]
+    return schema
+
+
+def models_json_schema_bundle(
+    models: Sequence[tuple[type[BaseModel] | type[PydanticDataclass], JsonSchemaMode]],
+    *,
+    uri_allocator: Callable[[str], str],
+    by_alias: bool = True,
+    ref_template: str = DEFAULT_REF_TEMPLATE,
+    union_format: Literal['any_of', 'primitive_type_array'] = 'any_of',
+    schema_generator: type[GenerateJsonSchema] = GenerateJsonSchema,
+) -> JsonSchemaBundle:
+    """Utility function to generate JSON schemas for multiple models as a bundle of standalone documents,
+    suitable for publishing the definitions of several APIs to a shared public directory.
+
+    Unlike [`models_json_schema`][pydantic.json_schema.models_json_schema] (which collects every
+    definition in a single `$defs` object and leaves the caller to split it into documents and fix up
+    references), this function returns one schema per entry point plus one standalone document per
+    definition, with every reference already rewritten to the public URI of the document it targets.
+
+    Args:
+        models: A sequence of tuples of the form (model, mode).
+        uri_allocator: A callable that maps each definition name to the public URI at which the definition
+            document will be published. Definitions with identical schemas (including definitions only
+            referenced recursively) share a single document, while definitions with colliding names but
+            different schemas are kept in separate documents. The allocator must not return the same URI
+            for two distinct documents.
+        by_alias: Whether field aliases should be used as keys in the generated JSON Schema.
+        ref_template: The reference template to use when generating the internal references that are then
+            rewritten to the allocated URIs.
+        union_format: The format to use when combining schemas from unions together. Can be one of:
+
+            - `'any_of'`: Use the [`anyOf`](https://json-schema.org/understanding-json-schema/reference/combining#anyOf)
+              keyword to combine schemas (the default).
+            - `'primitive_type_array'`: Use the [`type`](https://json-schema.org/understanding-json-schema/reference/type)
+              keyword as an array of strings, containing each type of the combination. If any of the schemas is not a primitive
+              type (`string`, `boolean`, `null`, `integer` or `number`) or contains constraints/metadata, falls back to
+              `any_of`.
+        schema_generator: The schema generator to use for generating the JSON Schema.
+
+    Returns:
+        A [`JsonSchemaBundle`][pydantic.json_schema.JsonSchemaBundle] whose `entries` are keyed by
+            stable entry identifiers (sorted by identifier) and whose `definitions` are keyed by the
+            allocated public URIs (sorted by URI). Every `$ref` and `discriminator.mapping` reference
+            in the returned schemas resolves to one of the returned definition documents.
+
+    Raises:
+        PydanticUserError: If two different models produce the same entry identifier, or if the URI
+            allocator assigns the same URI to two distinct definitions.
+    """
+    entries_by_id: dict[str, tuple[type[BaseModel] | type[PydanticDataclass], JsonSchemaMode]] = {}
+    for cls, mode in models:
+        entry_id = f'{cls.__module__}.{cls.__qualname__}:{mode}'
+        existing = entries_by_id.setdefault(entry_id, (cls, mode))
+        if existing[0] is not cls:
+            raise PydanticUserError(
+                f'Models {existing[0]!r} and {cls!r} have the same bundle entry identifier ({entry_id!r}); '
+                'bundle entries must have unique module and qualified names.',
+                code='json-schema-bundle-entry-collision',
+            )
+
+    # Sort the inputs by their stable identifier so that the result (including generated definition
+    # names) does not depend on the order in which the models were passed in or created:
+    ordered_entries = sorted(entries_by_id.items())
+
+    for cls, _mode in entries_by_id.values():
+        if isinstance(cls.__pydantic_core_schema__, _mock_val_ser.MockCoreSchema):
+            cls.__pydantic_core_schema__.rebuild()
+
+    instance = schema_generator(by_alias=by_alias, ref_template=ref_template, union_format=union_format)
+    inputs: list[tuple[str, JsonSchemaMode, CoreSchema]] = [
+        (entry_id, mode, cls.__pydantic_core_schema__) for entry_id, (cls, mode) in ordered_entries
+    ]
+    json_schemas_map, definitions = instance.generate_definitions(inputs)
+
+    # The reference strings produced by the generator for each remaining definition:
+    ref_strings = {defs_ref: ref_template.format(model=defs_ref) for defs_ref in definitions}
+
+    # Group definitions with identical schemas so that they can share a single document. Because
+    # definitions can reference each other (including recursively), group membership is computed as a
+    # fixed point: two definitions are equivalent when their schemas are equal once the references they
+    # contain are replaced by the group of the referenced definition.
+    groups: dict[DefsRef, DefsRef] = {defs_ref: defs_ref for defs_ref in definitions}
+    for _iter in range(100):  # 100 iterations should be more than enough to reach the fixed point
+        group_refs = {ref_string: groups[defs_ref] for defs_ref, ref_string in ref_strings.items()}
+        signatures = {
+            defs_ref: json.dumps(_remap_schema_refs(definition, group_refs), sort_keys=True)
+            for defs_ref, definition in definitions.items()
+        }
+        representatives: dict[str, DefsRef] = {}
+        new_groups = {
+            defs_ref: representatives.setdefault(signatures[defs_ref], defs_ref) for defs_ref in sorted(signatures)
+        }
+        if new_groups == groups:
+            break
+        groups = new_groups
+    else:
+        raise PydanticInvalidForJsonSchema('Failed to group identical JSON schema definitions')
+
+    representative_uris: dict[DefsRef, str] = {}
+    for representative in sorted(set(groups.values())):
+        representative_uris[representative] = uri_allocator(representative)
+    uri_to_representative: dict[str, DefsRef] = {}
+    for representative, uri in representative_uris.items():
+        existing = uri_to_representative.setdefault(uri, representative)
+        if existing != representative:
+            raise PydanticUserError(
+                f'The URI allocator returned the same URI ({uri!r}) for the distinct definitions '
+                f'{existing!r} and {representative!r}.',
+                code='json-schema-bundle-uri-collision',
+            )
+
+    ref_to_uri = {ref_string: representative_uris[groups[defs_ref]] for defs_ref, ref_string in ref_strings.items()}
+
+    entries: dict[str, JsonSchemaValue] = {}
+    for entry_id, (_cls, mode) in ordered_entries:
+        entries[entry_id] = _remap_schema_refs(json_schemas_map[(entry_id, mode)], ref_to_uri)
+
+    documents: dict[str, JsonSchemaValue] = {}
+    for representative in sorted(representative_uris, key=lambda r: representative_uris[r]):
+        uri = representative_uris[representative]
+        documents[uri] = {'$id': uri, **_remap_schema_refs(definitions[representative], ref_to_uri)}
+
+    return JsonSchemaBundle(entries=entries, definitions=documents)
 
 
 # ##### End JSON Schema Generation Functions #####
