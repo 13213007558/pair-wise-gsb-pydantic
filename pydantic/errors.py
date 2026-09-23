@@ -21,6 +21,9 @@ __all__ = (
     'PydanticInvalidForJsonSchema',
     'PydanticForbiddenQualifier',
     'PydanticErrorCodes',
+    'OverloadMatchError',
+    'NoMatchingOverloadError',
+    'AmbiguousOverloadError',
 )
 
 # We use this URL to allow for future flexibility about how we host the docs, while allowing for Pydantic
@@ -72,6 +75,7 @@ PydanticErrorCodes = Literal[
     'with-config-on-model',
     'dataclass-on-model',
     'validate-call-type',
+    'validate-call-overloads',
     'unpack-typed-dict',
     'overlapping-unpack-typed-dict',
     'invalid-self-type',
@@ -100,6 +104,18 @@ class PydanticErrorMixin:
 
 class PydanticUserError(PydanticErrorMixin, TypeError):
     """An error raised due to incorrect use of Pydantic."""
+
+
+class OverloadMatchError(TypeError):
+    """Base class for errors raised when a call cannot be dispatched to an overload of the function."""
+
+
+class NoMatchingOverloadError(OverloadMatchError):
+    """Raised when no overload signature of the function matches the provided arguments."""
+
+
+class AmbiguousOverloadError(OverloadMatchError):
+    """Raised when multiple overload signatures match and no explicit `overload_priority` resolves the ambiguity."""
 
 
 class PydanticUndefinedAnnotation(PydanticErrorMixin, NameError):

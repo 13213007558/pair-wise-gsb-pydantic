@@ -185,8 +185,51 @@ using all possible [parameter configurations][parameter] and all possible combin
 
     For reference, see the [related specification section] and [PEP 692].
 
-    [related specification section]: https://typing.readthedocs.io/en/latest/spec/callables.html#unpack-for-keyword-arguments
-    [PEP 692]: https://peps.python.org/pep-0692/
+   [related specification section]: https://typing.readthedocs.io/en/latest/spec/callables.html#unpack-for-keyword-arguments
+   [PEP 692]: https://peps.python.org/pep-0692/
+
+## Overloaded functions
+
+By default, [`validate_call()`][pydantic.validate_call] validates arguments against the implementation
+signature of the function, which is often broader than the individual [`@overload`][typing.overload]
+signatures. Setting `validate_overloads=True` dispatches each call to one of the overloads (as returned
+by [`typing.get_overloads()`][typing.get_overloads]) instead:
+
+* Overloads are first filtered using Python's argument binding rules, then by validating the argument
+  types. Parameter validators of an overload that cannot even be bound are never executed.
+* The converted arguments of the chosen overload are used to call the function, so parameter validators
+  and the function body run at most once per call.
+* If no overload matches, a [`NoMatchingOverloadError`][pydantic.NoMatchingOverloadError] is raised,
+  listing the binding or validation error of every overload.
+* If several overloads match, an [`AmbiguousOverloadError`][pydantic.AmbiguousOverloadError] is raised —
+  the declaration order is never used silently. Pass `overload_priority` (a list of overload indices in
+  declaration order) to define an explicit priority order.
+* With `validate_return=True`, the return value is validated against the chosen overload's return
+  annotation (after `await` for coroutine functions).
+
+```python
+from typing import overload
+
+from pydantic import validate_call
+
+
+@overload
+def rpc(value: int) -> int: ...
+
+
+@overload
+def rpc(value: str, *, tag: str = 'default') -> str: ...
+
+
+@validate_call(validate_overloads=True, overload_priority=[0, 1])
+def rpc(value, tag='default'):
+    return value
+
+
+rpc(1)  # dispatched to the first overload
+rpc('1')  # '1' is also coercible to int, but the first overload has priority
+rpc('a', tag='t')  # dispatched to the second overload
+```
 
 ## Using the [`Field()`][pydantic.Field] function to describe function parameters
 

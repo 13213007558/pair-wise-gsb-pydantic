@@ -103,6 +103,9 @@ __all__ = (
     'Extra',
     # validate_call
     'validate_call',
+    'OverloadMatchError',
+    'NoMatchingOverloadError',
+    'AmbiguousOverloadError',
     # errors
     'PydanticErrorCodes',
     'PydanticUserError',
@@ -272,6 +275,9 @@ _dynamic_imports: 'dict[str, tuple[str, str]]' = {
     'with_config': (__spec__.parent, '.config'),
     # validate call
     'validate_call': (__spec__.parent, '.validate_call_decorator'),
+    'OverloadMatchError': (__spec__.parent, '.errors'),
+    'NoMatchingOverloadError': (__spec__.parent, '.errors'),
+    'AmbiguousOverloadError': (__spec__.parent, '.errors'),
     # errors
     'PydanticErrorCodes': (__spec__.parent, '.errors'),
     'PydanticUserError': (__spec__.parent, '.errors'),
