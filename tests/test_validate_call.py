@@ -2,6 +2,7 @@ import asyncio
 import inspect
 import re
 import sys
+from collections.abc import AsyncGenerator, AsyncIterator
 from datetime import datetime, timezone
 from functools import partial
 from typing import Annotated, Any, Generic, Literal, TypeVar, Union
@@ -1091,6 +1092,169 @@ def test_async_func() -> None:
             'input': 'x',
         }
     ]
+
+
+def test_async_gen_func_validate_return() -> None:
+    events = []
+
+    @validate_call(validate_return=True)
+    async def rpc(start: int) -> AsyncGenerator[int, int]:
+        events.append('enter')
+        try:
+            control = yield str(start)
+            events.append(('received', control))
+            control = yield str(control * 10)
+            events.append(('received', control))
+            yield '7'
+        finally:
+            events.append('exit')
+
+    async def main() -> None:
+        gen = rpc('1')
+        # calling the function must not start the underlying generator:
+        assert events == []
+
+        assert await gen.__anext__() == 1
+        assert events == ['enter']
+
+        # sent values are coerced to the send type before reaching the generator,
+        # yielded values are coerced to the yield type before reaching the caller:
+        assert await gen.asend('2') == 20
+        assert events == ['enter', ('received', 2)]
+        assert await gen.asend(3) == 7
+        assert events == ['enter', ('received', 2), ('received', 3)]
+
+        # a send value that fails validation closes the underlying generator exactly once:
+        with pytest.raises(ValidationError) as exc_info:
+            await gen.asend('not an int')
+        assert [e['loc'] for e in exc_info.value.errors(include_url=False)] == [('send', 3)]
+        assert events.count('exit') == 1
+
+        with pytest.raises(StopAsyncIteration):
+            await gen.__anext__()
+
+    asyncio.run(main())
+
+
+def test_async_gen_func_yield_error() -> None:
+    events = []
+
+    @validate_call(validate_return=True)
+    async def gen_func() -> AsyncGenerator[int, None]:
+        try:
+            yield 1
+            yield 'not an int'
+            yield 3
+        finally:
+            events.append('exit')
+
+    async def main() -> None:
+        gen = gen_func()
+        assert await gen.__anext__() == 1
+        with pytest.raises(ValidationError) as exc_info:
+            await gen.__anext__()
+        assert [e['loc'] for e in exc_info.value.errors(include_url=False)] == [('yield', 2)]
+        # the underlying generator was closed so that its finally block ran:
+        assert events == ['exit']
+
+    asyncio.run(main())
+
+
+def test_async_gen_func_athrow() -> None:
+    @validate_call(validate_return=True)
+    async def handled() -> AsyncGenerator[int, None]:
+        try:
+            yield 1
+        except ValueError:
+            yield '2'
+        yield 3
+
+    @validate_call(validate_return=True)
+    async def unhandled() -> AsyncGenerator[int, None]:
+        try:
+            yield 1
+        finally:
+            events.append('exit')
+
+    events = []
+
+    async def main() -> None:
+        # exceptions thrown into the wrapper are forwarded to the underlying generator:
+        gen = handled()
+        assert await gen.__anext__() == 1
+        assert await gen.athrow(ValueError('boom')) == 2
+        assert await gen.__anext__() == 3
+        with pytest.raises(StopAsyncIteration):
+            await gen.__anext__()
+
+        # exceptions not handled by the underlying generator propagate unchanged:
+        gen = unhandled()
+        assert await gen.__anext__() == 1
+        with pytest.raises(KeyError):
+            await gen.athrow(KeyError('boom'))
+        assert events == ['exit']
+
+    asyncio.run(main())
+
+
+def test_async_gen_func_aclose() -> None:
+    events = []
+
+    @validate_call(validate_return=True)
+    async def gen_func() -> AsyncGenerator[int, None]:
+        try:
+            yield 1
+            yield 2
+        finally:
+            events.append('exit')
+
+    async def main() -> None:
+        gen = gen_func()
+        assert await gen.__anext__() == 1
+        await gen.aclose()
+        assert events == ['exit']
+
+    asyncio.run(main())
+
+
+def test_async_gen_func_cancellation() -> None:
+    events = []
+
+    @validate_call(validate_return=True)
+    async def gen_func() -> AsyncGenerator[int, None]:
+        try:
+            yield 1
+            await asyncio.sleep(10)
+            yield 2
+        finally:
+            events.append('exit')
+
+    async def main() -> None:
+        gen = gen_func()
+        assert await gen.__anext__() == 1
+        task = asyncio.ensure_future(gen.__anext__())
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0)
+        assert events == ['exit']
+
+    asyncio.run(main())
+
+
+def test_async_iterator_func_validate_return() -> None:
+    @validate_call(validate_return=True)
+    async def gen_func() -> AsyncIterator[int]:
+        yield '1'
+
+    async def main() -> None:
+        gen = gen_func()
+        assert await gen.__anext__() == 1
+        with pytest.raises(StopAsyncIteration):
+            await gen.__anext__()
+
+    asyncio.run(main())
 
 
 def test_validate_call_with_slots() -> None:

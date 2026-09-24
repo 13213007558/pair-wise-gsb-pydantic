@@ -73,6 +73,13 @@ can be enabled by using a [custom configuration](#custom-configuration).
     By default, the return value of the function is **not** validated. To do so, the `validate_return` argument
     of the decorator can be set to `True`.
 
+    For async generator functions annotated with `AsyncGenerator[YieldType, SendType]` (or `AsyncIterator[YieldType]`),
+    the yielded and sent values are validated separately and lazily: each value produced by the generator is
+    validated against `YieldType`, and each value sent via `asend()` (after the initial one) is validated against
+    `SendType` before being forwarded to the generator. The generator is never consumed eagerly; if validation
+    fails, the underlying generator is closed (running any `finally` blocks) and the validation error is raised
+    with a location indicating which yield or send failed.
+
 ## Function signatures
 
 The [`validate_call()`][pydantic.validate_call] decorator is designed to work with functions
