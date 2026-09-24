@@ -320,6 +320,42 @@ asyncio.run(main())
 # requires: `conn.execute()` that will return `'testing@example.com'`
 ```
 
+### Async generators
+
+With `validate_return=True`, async generator functions annotated with
+`AsyncGenerator[YieldType, SendType]` are also supported. Yielded values are validated (and coerced)
+against `YieldType` as they are produced, and values sent with `asend()` are validated against
+`SendType`. Validation happens lazily: the generator is never advanced eagerly nor collected:
+
+```python
+import asyncio
+from collections.abc import AsyncGenerator
+
+from pydantic import validate_call
+
+
+@validate_call(validate_return=True)
+async def stream_numbers() -> AsyncGenerator[int, int]:
+    count = yield 1
+    while count is not None:
+        count = yield count
+
+
+async def main():
+    stream = stream_numbers()
+    print(await stream.__anext__())
+    #> 1
+    print(await stream.asend('42'))  # coerced to `int`
+    #> 42
+
+
+asyncio.run(main())
+```
+
+If a yielded or sent value fails validation, a [`ValidationError`][pydantic.ValidationError] is
+raised with the error location indicating the index of the offending `yield` or `send`, and the
+underlying generator is closed (running any `finally` blocks it may have).
+
 ## Compatibility with type checkers
 
 As the [`validate_call()`][pydantic.validate_call] decorator preserves the decorated function's signature,

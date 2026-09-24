@@ -2,6 +2,7 @@ import asyncio
 import inspect
 import re
 import sys
+from collections.abc import AsyncGenerator, Generator
 from datetime import datetime, timezone
 from functools import partial
 from typing import Annotated, Any, Generic, Literal, TypeVar, Union
@@ -1091,6 +1092,191 @@ def test_async_func() -> None:
             'input': 'x',
         }
     ]
+
+
+def test_sync_generator_validate_return() -> None:
+    @validate_call(validate_return=True)
+    def gen_func() -> Generator[int, None, None]:
+        yield '1'
+        yield 2
+
+    assert list(gen_func()) == [1, 2]
+
+
+def test_async_generator_validate_return() -> None:
+    events = []
+
+    @validate_call(validate_return=True)
+    async def rpc() -> AsyncGenerator[int, int]:
+        events.append('started')
+        try:
+            control = yield '1'
+            events.append(('control', control))
+            control = yield 2
+            events.append(('control', control))
+            yield 3
+        finally:
+            events.append('closed')
+
+    gen = rpc()
+    # calling the function does not advance the generator eagerly:
+    assert events == []
+
+    async def main():
+        assert await gen.__anext__() == 1
+        # the generator suspends after the first yield, waiting for a control parameter:
+        assert events == ['started']
+        # the sent value is converted to the send type, the yielded value to the yield type:
+        assert await gen.asend('10') == 2
+        assert await gen.asend(20) == 3
+        with pytest.raises(StopAsyncIteration):
+            await gen.__anext__()
+
+    asyncio.run(main())
+    assert events == ['started', ('control', 10), ('control', 20), 'closed']
+
+
+def test_async_generator_validate_return_async_for() -> None:
+    @validate_call(validate_return=True)
+    async def gen_func() -> AsyncGenerator[int, None]:
+        yield '1'
+        yield 2
+
+    async def main():
+        return [value async for value in gen_func()]
+
+    assert asyncio.run(main()) == [1, 2]
+
+
+def test_async_generator_no_validate_return() -> None:
+    @validate_call
+    async def gen_func(a: int) -> AsyncGenerator[int, None]:
+        yield a
+
+    async def main():
+        return [value async for value in gen_func('1')]
+
+    assert asyncio.run(main()) == [1]
+
+
+def test_async_generator_validate_return_yield_error() -> None:
+    closes = 0
+
+    @validate_call(validate_return=True)
+    async def gen_func() -> AsyncGenerator[int, None]:
+        nonlocal closes
+        try:
+            yield 1
+            yield 'not an int'
+        finally:
+            closes += 1
+
+    async def main():
+        gen = gen_func()
+        assert await gen.__anext__() == 1
+        with pytest.raises(ValidationError) as exc_info:
+            await gen.__anext__()
+        # insert_assert(exc_info.value.errors(include_url=False))
+        assert exc_info.value.errors(include_url=False) == [
+            {
+                'type': 'int_parsing',
+                'loc': ('yield', 1),
+                'msg': 'Input should be a valid integer, unable to parse string as an integer',
+                'input': 'not an int',
+            }
+        ]
+
+    asyncio.run(main())
+    # the failing generator was closed exactly once, running its finally block:
+    assert closes == 1
+
+
+def test_async_generator_validate_return_send_error() -> None:
+    closes = 0
+
+    @validate_call(validate_return=True)
+    async def gen_func() -> AsyncGenerator[int, int]:
+        nonlocal closes
+        try:
+            control = yield 1
+            yield control
+        finally:
+            closes += 1
+
+    async def main():
+        gen = gen_func()
+        assert await gen.__anext__() == 1
+        with pytest.raises(ValidationError) as exc_info:
+            await gen.asend('not an int')
+        # insert_assert(exc_info.value.errors(include_url=False))
+        assert exc_info.value.errors(include_url=False) == [
+            {
+                'type': 'int_parsing',
+                'loc': ('send', 0),
+                'msg': 'Input should be a valid integer, unable to parse string as an integer',
+                'input': 'not an int',
+            }
+        ]
+
+    asyncio.run(main())
+    # the failing generator was closed exactly once, running its finally block:
+    assert closes == 1
+
+
+def test_async_generator_validate_return_athrow() -> None:
+    @validate_call(validate_return=True)
+    async def gen_func() -> AsyncGenerator[int, None]:
+        try:
+            yield 1
+        except ValueError:
+            yield '2'
+
+    async def main():
+        gen = gen_func()
+        assert await gen.__anext__() == 1
+        # the generator catches the thrown error and yields again, the value is validated:
+        assert await gen.athrow(ValueError) == 2
+        # an exception the generator does not catch propagates unchanged:
+        with pytest.raises(KeyError):
+            await gen.athrow(KeyError)
+
+        gen = gen_func()
+        assert await gen.__anext__() == 1
+        # cancellation keeps its original propagation semantics:
+        with pytest.raises(asyncio.CancelledError):
+            await gen.athrow(asyncio.CancelledError)
+
+    asyncio.run(main())
+
+
+def test_async_generator_validate_return_future_annotations(create_module) -> None:
+    module = create_module(
+        # language=Python
+        """
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncGenerator
+
+from pydantic import validate_call
+
+
+@validate_call(validate_return=True)
+async def gen_func() -> AsyncGenerator[int, int]:
+    control = yield '1'
+    yield control
+
+
+def main():
+    async def run():
+        gen = gen_func()
+        assert await gen.__anext__() == 1
+        assert await gen.asend('2') == 2
+
+    asyncio.run(run())
+"""
+    )
+    module.main()
 
 
 def test_validate_call_with_slots() -> None:
