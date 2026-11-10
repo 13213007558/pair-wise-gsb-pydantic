@@ -423,3 +423,66 @@ print(m.model_dump(by_alias=True))  # (1)!
 !!! note
     The fact that serialization by alias is disabled by default is notably inconsistent with the default for
     validation (where aliases are used by default). We anticipate changing this default in V3.
+
+## Detecting ambiguous alias inputs
+
+When a field can be populated from more than one input entry (its field name, an alias,
+or one of several `AliasChoices`/`AliasPath` entries), Pydantic silently selects one of
+them by default. During a field rename this means a client that sends both the old and
+the new name is accepted without warning.
+
+Set `validate_alias_ambiguity=True` to turn this situation into a validation error. The
+check reports a conflict whenever several *readable* entries for the same field are
+present at once, even if their values are identical. Entries that the current
+configuration does not read — the field name when
+[`validate_by_name`][pydantic.config.ConfigDict.validate_by_name] is disabled, or aliases
+when [`validate_by_alias`][pydantic.config.ConfigDict.validate_by_alias] is disabled —
+are not considered. A missing `AliasPath` is likewise not treated as present, so a path
+that exists and holds `None` conflicts while an absent path does not.
+
+The error marks the conflicting field and input paths but never echoes the submitted
+values, so credentials such as account identifiers are not leaked back to the client.
+
+### Migration: accepting an old name, then ending compatibility
+
+```py
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+
+# Stage 1: accept the new name, keep the legacy name working, and detect clients
+# that still send both so they can be migrated before the alias is removed.
+class AuthRequest(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,  # the new field name is accepted...
+        validate_alias_ambiguity=True,  # ...and sending both names now fails
+    )
+
+    account_id: int = Field(validation_alias='accountId')  # legacy client name
+
+
+print(AuthRequest(account_id=1).account_id)
+#> 1
+print(AuthRequest(accountId=2).account_id)
+#> 2
+
+try:
+    AuthRequest(account_id=1, accountId=2)
+except ValidationError as exc:
+    print(exc.errors()[0]['type'])
+    #> alias_ambiguity
+
+
+# Stage 2: once no client relies on the legacy name, drop the alias (and the
+# extra flags) to end compatibility. `accountId` is then simply an extra input.
+class AuthRequestV2(BaseModel):
+    account_id: int
+
+
+print(AuthRequestV2(account_id=1).account_id)
+#> 1
+```
+
+The same check applies to nested models, models validated through
+[`TypeAdapter`][pydantic.type_adapter.TypeAdapter], Pydantic dataclasses, and
+`TypedDict`s, and runs before any field or model validator you define. When the setting
+is left at its default of `False`, the historical lenient behavior is unchanged.

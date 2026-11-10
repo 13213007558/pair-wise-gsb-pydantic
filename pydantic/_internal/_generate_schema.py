@@ -69,6 +69,7 @@ from ..warnings import (
     UnsupportedFieldAttributeWarning,
 )
 from . import _decorators, _discriminated_union, _known_annotated_metadata, _repr, _typing_extra
+from ._alias_ambiguity import build_alias_ambiguity_check
 from ._config import ConfigWrapper, ConfigWrapperStack
 from ._core_metadata import CoreMetadata, update_core_metadata
 from ._core_utils import (
@@ -738,6 +739,28 @@ class GenerateSchema:
 
         return schema
 
+    def _wrap_with_alias_ambiguity_check(
+        self, schema: CoreSchema, fields: dict[str, FieldInfo], model_name: str
+    ) -> CoreSchema:
+        """Wrap `schema` with an opt-in check for fields populated through multiple entries."""
+        config_wrapper = self._config_wrapper
+        if not config_wrapper.validate_alias_ambiguity:
+            return schema
+        wrap = build_alias_ambiguity_check(
+            fields,
+            model_name=model_name,
+            validate_by_alias=config_wrapper.validate_by_alias,
+            validate_by_name=config_wrapper.validate_by_name,
+            from_attributes=config_wrapper.from_attributes,
+        )
+        if wrap is None:
+            return schema
+        ref = schema.pop('ref', None)  # type: ignore
+        wrapped = wrap(schema)
+        if ref is not None:
+            wrapped['ref'] = ref  # type: ignore
+        return wrapped
+
     def _model_schema(self, cls: type[BaseModel]) -> core_schema.CoreSchema:
         """Generate schema for a Pydantic model."""
         BaseModel_ = import_cached_base_model()
@@ -875,6 +898,9 @@ class GenerateSchema:
                         config=core_config,
                         ref=model_ref,
                     )
+
+                # Run before every business validator so an ambiguous input fails fast.
+                model_schema = self._wrap_with_alias_ambiguity_check(model_schema, fields, cls.__name__)
 
                 schema = self._apply_model_serializers(model_schema, decorators.model_serializers.values())
                 schema = apply_model_validators(schema, model_validators, 'outer')
@@ -1419,6 +1445,7 @@ class GenerateSchema:
                 required_keys: frozenset[str] = typed_dict_cls.__required_keys__
 
                 fields: dict[str, core_schema.TypedDictField] = {}
+                field_infos: dict[str, FieldInfo] = {}
 
                 decorators = DecoratorInfos.build(typed_dict_cls)
                 decorators.update_from_config(self._config_wrapper)
@@ -1452,6 +1479,7 @@ class GenerateSchema:
                     ):
                         field_info.description = field_docstrings[field_name]
                     update_field_from_config(self._config_wrapper, field_name, field_info)
+                    field_infos[field_name] = field_info
 
                     fields[field_name] = self._generate_td_field_schema(
                         field_name, field_info, decorators, required=required
@@ -1511,6 +1539,8 @@ class GenerateSchema:
 
                 schema = self._apply_model_serializers(td_schema, decorators.model_serializers.values())
                 schema = apply_model_validators(schema, decorators.model_validators.values(), 'all')
+                # Run before every business validator so an ambiguous input fails fast.
+                schema = self._wrap_with_alias_ambiguity_check(schema, field_infos, typed_dict_cls.__name__)
                 return self.defs.create_definition_reference_schema(schema)
 
     def _namedtuple_schema(self, namedtuple_cls: Any, origin: Any) -> core_schema.CoreSchema:
@@ -1933,6 +1963,8 @@ class GenerateSchema:
                 )
                 schema = self._apply_model_serializers(dc_schema, decorators.model_serializers.values())
                 schema = apply_model_validators(schema, model_validators, 'outer')
+                # Run before every business validator so an ambiguous input fails fast.
+                schema = self._wrap_with_alias_ambiguity_check(schema, fields, dataclass.__name__)
                 return self.defs.create_definition_reference_schema(schema)
 
     def _call_schema(self, function: ValidateCallSupportedTypes) -> core_schema.CallSchema:

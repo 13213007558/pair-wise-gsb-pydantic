@@ -88,6 +88,7 @@ class ConfigWrapper:
     validate_by_name: bool
     serialize_by_alias: bool
     url_preserve_empty_path: bool
+    validate_alias_ambiguity: bool
 
     def __init__(self, config: ConfigDict | dict[str, Any] | type[Any] | None, *, check: bool = True):
         if check:
@@ -314,6 +315,7 @@ config_defaults = ConfigDict(
     validate_by_name=False,
     serialize_by_alias=False,
     url_preserve_empty_path=False,
+    validate_alias_ambiguity=False,
 )
 
 

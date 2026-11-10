@@ -1219,6 +1219,44 @@ class ConfigDict(TypedDict, total=False):
     """
 
 
+    validate_alias_ambiguity: bool
+    """
+    Whether to report a validation error when one field is populated through several readable
+    input entries at once (for example its field name together with an alias, or several
+    `AliasChoices`/`AliasPath` entries). Defaults to `False`, which preserves the lenient
+    behaviour of silently selecting one entry.
+
+    Only entries that the current configuration allows reading are considered: the plain field
+    name participates only when [`validate_by_name`][pydantic.config.ConfigDict.validate_by_name]
+    is enabled, while aliases participate only when
+    [`validate_by_alias`][pydantic.config.ConfigDict.validate_by_alias] is enabled. A missing
+    alias path is not treated as present, so it never conflicts even when another entry for the
+    same field is provided.
+
+    ```python
+    from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+    class AuthRequest(BaseModel):
+        model_config = ConfigDict(
+            populate_by_name=True,
+            validate_alias_ambiguity=True,
+        )
+
+        account_id: int = Field(validation_alias='accountId')
+
+        print(AuthRequest(account_id=1).account_id)
+        #> 1
+        print(AuthRequest(accountId=2).account_id)
+        #> 2
+        try:
+            AuthRequest(account_id=1, accountId=2)
+        except ValidationError as exc:
+            print(exc.errors()[0]['type'])
+            #> alias_ambiguity
+    ```
+    """
+
+
 _TypeT = TypeVar('_TypeT', bound=type)
 
 
